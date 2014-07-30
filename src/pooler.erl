@@ -38,7 +38,9 @@
          pool_stats/1,
          manual_start/0,
          new_pool/1,
-         rm_pool/1]).
+         pool_child_spec/1,
+         rm_pool/1,
+         rm_group/1]).
 
 %% ------------------------------------------------------------------
 %% gen_server Function Exports
@@ -118,6 +120,50 @@ new_pool(PoolConfig) ->
 %% @doc Terminate the named pool.
 rm_pool(PoolName) ->
     pooler_sup:rm_pool(PoolName).
+
+%% @doc Terminates the group and all pools in that group.
+%%
+%% If termination of any member pool fails, `rm_group/1` returns
+%% `{error, {failed_delete_pools, Pools}}`, where `Pools` is a list
+%% of pools that failed to terminate.
+%%
+%% The group is NOT terminated if any member pool did not
+%% successfully terminate.
+%%
+-spec rm_group(atom()) -> ok | {error, {failed_rm_pools, [atom()]}}.
+rm_group(GroupName) ->
+    case pg2:get_local_members(GroupName) of
+        {error, {no_such_group, GroupName}} ->
+            ok;
+        Pools ->
+            case rm_group_members(Pools) of
+                [] ->
+                    pg2:delete(GroupName);
+                Failures ->
+                    {error, {failed_rm_pools, Failures}}
+            end
+    end.
+
+-spec rm_group_members([pid()]) -> [atom()].
+rm_group_members(MemberPids) ->
+    lists:foldl(
+      fun(MemberPid, Acc) ->
+              Pool = gen_server:call(MemberPid, dump_pool),
+              PoolName = Pool#pool.name,
+              case pooler_sup:rm_pool(PoolName) of
+                  ok -> Acc;
+                  _  -> [PoolName | Acc]
+              end
+      end,
+      [],
+      MemberPids).
+
+%% @doc Get child spec described by the proplist `PoolConfig'.
+%%
+%% See {@link pooler:new_pool/1} for info about `PoolConfig'.
+-spec pool_child_spec([{atom(), term()}]) -> supervisor:child_spec().
+pool_child_spec(PoolConfig) ->
+    pooler_sup:pool_child_spec(PoolConfig).
 
 %% @doc For INTERNAL use. Adds `MemberPid' to the pool.
 -spec accept_member(atom() | pid(), pid() | {noproc, _}) -> ok.
@@ -491,7 +537,7 @@ clean_group_table(MemberPid, #pool{group = _GroupName}) ->
 % If `Pid' is the last element in `CPid's pid list, then the `CPid'
 % entry is removed entirely.
 %
--spec cpmap_remove(pid(), pid() | free, dict()) -> dict().
+-spec cpmap_remove(pid(), pid() | free, p_dict()) -> p_dict().
 cpmap_remove(_Pid, free, CPMap) ->
     CPMap;
 cpmap_remove(Pid, CPid, CPMap) ->
@@ -548,18 +594,18 @@ remove_pid(Pid, Pool) ->
     end.
 
 -spec store_all_members(pid(),
-                        {reference(), free | pid(), {_, _, _}}, dict()) -> dict().
+                        {reference(), free | pid(), {_, _, _}}, p_dict()) -> p_dict().
 store_all_members(Pid, Val = {_MRef, _CPid, _Time}, AllMembers) ->
     dict:store(Pid, Val, AllMembers).
 
--spec set_cpid_for_member(pid(), pid(), dict()) -> dict().
+-spec set_cpid_for_member(pid(), pid(), p_dict()) -> p_dict().
 set_cpid_for_member(MemberPid, CPid, AllMembers) ->
     dict:update(MemberPid,
                 fun({MRef, free, Time = {_, _, _}}) ->
                         {MRef, CPid, Time}
                 end, AllMembers).
 
--spec add_member_to_consumer(pid(), pid(), dict()) -> dict().
+-spec add_member_to_consumer(pid(), pid(), p_dict()) -> p_dict().
 add_member_to_consumer(MemberPid, CPid, CPMap) ->
     %% we can't use dict:update here because we need to create the
     %% monitor if we aren't already tracking this consumer.
@@ -614,7 +660,7 @@ schedule_cull(PoolName, Delay) ->
     %% automatic cancelling
     erlang:send_after(DelayMillis, PoolName, cull_pool).
 
--spec member_info([pid()], dict()) -> [{pid(), member_info()}].
+-spec member_info([pid()], p_dict()) -> [{pid(), member_info()}].
 member_info(Pids, AllMembers) ->
     [ {P, dict:fetch(P, AllMembers)} || P <- Pids ].
 

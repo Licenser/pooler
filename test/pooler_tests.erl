@@ -155,6 +155,35 @@ pooler_basics_dynamic_test_() ->
      end,
      basic_tests()}}.
 
+pooler_basics_integration_to_other_supervisor_test_() ->
+    {setup,
+     fun() ->
+             application:set_env(pooler, metrics_module, fake_metrics),
+             fake_metrics:start_link()
+     end,
+     fun(_X) ->
+             fake_metrics:stop()
+     end,
+    {foreach,
+     % setup
+     fun() ->
+             Pool = [{name, test_pool_1},
+                     {max_count, 3},
+                     {init_count, 2},
+                     {start_mfa,
+                      {pooled_gs, start_link, [{"type-0"}]}}],
+             application:unset_env(pooler, pools),
+             error_logger:delete_report_handler(error_logger_tty_h),
+             application:start(pooler),
+             supervisor:start_link(fake_external_supervisor, Pool)
+     end,
+     fun({ok, SupPid}) ->
+             exit(SupPid, normal),
+             application:stop(pooler)
+     end,
+     basic_tests()}}.
+
+
 basic_tests() ->
      [
       {"there are init_count members at start",
@@ -273,16 +302,20 @@ basic_tests() ->
 
       {"dynamic pool creation",
        fun() ->
-               {ok, SupPid} = pooler:new_pool([{name, dyn_pool_1},
-                                               {max_count, 3},
-                                               {init_count, 2},
-                                               {start_mfa,
-                                                {pooled_gs, start_link, [{"dyn-0"}]}}]),
-               ?assert(is_pid(SupPid)),
+               PoolSpec = [{name, dyn_pool_1},
+                           {max_count, 3},
+                           {init_count, 2},
+                           {start_mfa,
+                            {pooled_gs, start_link, [{"dyn-0"}]}}],
+               {ok, SupPid1} = pooler:new_pool(PoolSpec),
+               ?assert(is_pid(SupPid1)),
                M = pooler:take_member(dyn_pool_1),
                ?assertMatch({"dyn-0", _Id}, pooled_gs:get_id(M)),
                ?assertEqual(ok, pooler:rm_pool(dyn_pool_1)),
                ?assertExit({noproc, _}, pooler:take_member(dyn_pool_1)),
+               %% verify pool of same name can be created after removal
+               {ok, SupPid2} = pooler:new_pool(PoolSpec),
+               ?assert(is_pid(SupPid2)),
                %% remove non-existing pool
                ?assertEqual(ok, pooler:rm_pool(dyn_pool_X)),
                ?assertEqual(ok, pooler:rm_pool(dyn_pool_1))
@@ -416,7 +449,6 @@ pooler_groups_test_() ->
        fun() ->
                ?assertEqual(ok, pooler:return_group_member(group_1, error_no_members))
        end},
-      
 
       {"exhaust pools in group",
        fun() ->
@@ -432,9 +464,50 @@ pooler_groups_test_() ->
                 error_no_members,
                 error_no_members] = [ pooler:take_group_member(group_1)
                                       || _I <- lists:seq(1, 3) ]
+       end},
+
+      {"rm_group with nonexisting group",
+       fun() ->
+               ?assertEqual(ok, pooler:rm_group(i_dont_exist))
+       end},
+
+      {"rm_group with existing empty group",
+       fun() ->
+               ?assertEqual(ok, pooler:rm_pool(test_pool_1)),
+               ?assertEqual(ok, pooler:rm_pool(test_pool_2)),
+               ?assertEqual(error_no_members, pooler:take_group_member(group_1)),
+               ?assertEqual(ok, pooler:rm_group(group_1)),
+
+               ?assertExit({noproc, _}, pooler:take_member(test_pool_1)),
+               ?assertExit({noproc, _}, pooler:take_member(test_pool_2)),
+               ?assertEqual({error_no_group, group_1},
+                            pooler:take_group_member(group_1))
+       end},
+
+      {"rm_group with existing non-empty group",
+       fun() ->
+               %% Verify that group members exist
+               MemberPid = pooler:take_group_member(group_1),
+               ?assert(is_pid(MemberPid)),
+               pooler:return_group_member(group_1, MemberPid),
+
+               Pool1Pid = pooler:take_member(test_pool_1),
+               ?assert(is_pid(Pool1Pid)),
+               pooler:return_member(test_pool_1, Pool1Pid),
+
+               Pool2Pid = pooler:take_member(test_pool_2),
+               ?assert(is_pid(Pool2Pid)),
+               pooler:return_member(test_pool_2, Pool2Pid),
+
+               %% Delete and verify that group and pools are destroyed
+               ?assertEqual(ok, pooler:rm_group(group_1)),
+
+               ?assertExit({noproc, _}, pooler:take_member(test_pool_1)),
+               ?assertExit({noproc, _}, pooler:take_member(test_pool_2)),
+               ?assertEqual({error_no_group, group_1},
+                            pooler:take_group_member(group_1))
        end}
      ]}}.
-               
 
 pooler_limit_failed_adds_test_() ->
     %% verify that pooler crashes completely if too many failures are
